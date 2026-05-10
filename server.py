@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Any
 import requests
+import os
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 
 app = FastAPI()
 
@@ -56,9 +58,6 @@ def get_summary():
         summary[cat] = summary.get(cat, 0) + 1
     return {"summary": summary, "total": len(_revit_data)}
 
-
-import os
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 
 SCHEMA = {
     "Name":                   {"title": {}},
