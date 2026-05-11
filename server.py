@@ -320,10 +320,10 @@ def run_tool(name, input_data):
         if not elements:
             return {"error": "No elements found"}
 
-        create_res = requests.post("http://localhost/create-database", json={
-            "parent_page_id": PARENT_PAGE_ID,
-            "title": title
-        })
+        #create_res = requests.post("http://localhost/create-database", json={
+            #"parent_page_id": PARENT_PAGE_ID,
+            #"title": title
+        #})
 
         # Call internal functions directly instead of HTTP
         headers = {
