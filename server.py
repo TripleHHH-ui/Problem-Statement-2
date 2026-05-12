@@ -6,13 +6,15 @@ import requests
 import anthropic
 import json
 import os
+import threading
 from datetime import date
 from fastapi.background import BackgroundTasks
 import threading
+
 app = FastAPI()
 
 # ----------------------------------------------------------------
-# Config from environment variables
+# Config
 # ----------------------------------------------------------------
 NOTION_TOKEN      = os.environ.get("NOTION_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -20,9 +22,13 @@ PARENT_PAGE_ID    = "3492bc72289b8081970ac57e2816e0c5"
 FIXED_DATABASE_ID = "3492bc72289b80dda791c15cf5a575e4"
 
 # ----------------------------------------------------------------
-# In-memory Revit data store
+# In-memory store
 # ----------------------------------------------------------------
 _revit_data = []
+
+# Background job status tracker
+# { job_id: { "status": "running"/"done"/"error", "message": "..." } }
+_jobs = {}
 
 class UploadPayload(BaseModel):
     elements: List[Any]
@@ -80,8 +86,13 @@ def get_summary():
     return {"summary": summary, "total": len(_revit_data)}
 
 
+@app.get("/job-status/{job_id}")
+def job_status(job_id: str):
+    return _jobs.get(job_id, {"status": "not_found"})
+
+
 # ----------------------------------------------------------------
-# Notion schema and helpers
+# Notion helpers
 # ----------------------------------------------------------------
 SCHEMA = {
     "Name":                   {"title": {}},
@@ -169,7 +180,6 @@ def build_props(el, version=None, export_date=None):
 
 
 def notion_create_database(title):
-    """Create a new Notion database and return its ID."""
     body = {
         "parent": {"type": "page_id", "page_id": format_uuid(PARENT_PAGE_ID)},
         "title": [{"type": "text", "text": {"content": title}}],
@@ -183,7 +193,6 @@ def notion_create_database(title):
 
 
 def notion_push_elements(db_id, elements, version=None, export_date=None):
-    """Push elements to a Notion database. Returns (ok_count, fail_count)."""
     ok, fail = 0, 0
     for el in elements:
         props = build_props(el, version=version, export_date=export_date)
@@ -198,8 +207,7 @@ def notion_push_elements(db_id, elements, version=None, export_date=None):
 
 
 def notion_get_next_version(db_id):
-    """Get the next version number for a fixed database."""
-    res  = requests.post(
+    res = requests.post(
         f"https://api.notion.com/v1/databases/{db_id}/query",
         headers=notion_headers(), json={}
     )
@@ -209,6 +217,69 @@ def notion_get_next_version(db_id):
         if v is not None:
             versions.append(v)
     return max(versions) + 1 if versions else 1
+
+
+# ----------------------------------------------------------------
+# Background push functions
+# ----------------------------------------------------------------
+def bg_create_new_database(job_id, title, elements):
+    try:
+        _jobs[job_id] = {"status": "running", "message": f"Creating database '{title}'..."}
+
+        db_id, err = notion_create_database(title)
+        if err:
+            _jobs[job_id] = {"status": "error", "message": f"Failed to create database: {err}"}
+            return
+
+        total = len(elements)
+        _jobs[job_id] = {"status": "running", "message": f"Pushing 0 / {total} records..."}
+
+        ok, fail = 0, 0
+        for i, el in enumerate(elements):
+            props = build_props(el, export_date=str(date.today()))
+            body  = {"parent": {"database_id": db_id}, "properties": props}
+            res   = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=body)
+            if res.status_code == 200:
+                ok += 1
+            else:
+                fail += 1
+            if (i + 1) % 10 == 0:
+                _jobs[job_id]["message"] = f"Pushing {i+1} / {total} records..."
+
+        _jobs[job_id] = {
+            "status": "done",
+            "message": f"✅ Done! '{title}' created with {ok} records pushed. {fail} failed."
+        }
+    except Exception as e:
+        _jobs[job_id] = {"status": "error", "message": f"Error: {str(e)}"}
+
+
+def bg_push_versioned(job_id, elements):
+    try:
+        db_id   = format_uuid(FIXED_DATABASE_ID)
+        version = notion_get_next_version(db_id)
+        total   = len(elements)
+
+        _jobs[job_id] = {"status": "running", "message": f"Pushing v{version}: 0 / {total} records..."}
+
+        ok, fail = 0, 0
+        for i, el in enumerate(elements):
+            props = build_props(el, version=version, export_date=str(date.today()))
+            body  = {"parent": {"database_id": db_id}, "properties": props}
+            res   = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=body)
+            if res.status_code == 200:
+                ok += 1
+            else:
+                fail += 1
+            if (i + 1) % 10 == 0:
+                _jobs[job_id]["message"] = f"Pushing v{version}: {i+1} / {total} records..."
+
+        _jobs[job_id] = {
+            "status": "done",
+            "message": f"✅ Done! v{version} pushed with {ok} records. {fail} failed."
+        }
+    except Exception as e:
+        _jobs[job_id] = {"status": "error", "message": f"Error: {str(e)}"}
 
 
 # ----------------------------------------------------------------
@@ -226,18 +297,18 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "category": {
-                    "type": "string",
-                    "enum": ["Room", "Door", "Wall", "Floor", "Parking"]
-                },
-                "keyword": {"type": "string"}
+                "category": {"type": "string", "enum": ["Room", "Door", "Wall", "Floor", "Parking"]},
+                "keyword":  {"type": "string"}
             },
             "required": []
         }
     },
     {
         "name": "create_new_database",
-        "description": "Create a new Notion database and push filtered Revit elements into it.",
+        "description": (
+            "Start pushing Revit elements into a new Notion database in the background. "
+            "Returns a job_id immediately. The push continues in the background."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -250,7 +321,10 @@ TOOLS = [
     },
     {
         "name": "push_versioned",
-        "description": "Push elements into the existing fixed Notion database with a version number.",
+        "description": (
+            "Start pushing Revit elements into the existing fixed Notion database in the background. "
+            "Returns a job_id immediately."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -258,6 +332,17 @@ TOOLS = [
                 "keyword":  {"type": "string"}
             },
             "required": []
+        }
+    },
+    {
+        "name": "check_job_status",
+        "description": "Check the status of a background push job using its job_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"}
+            },
+            "required": ["job_id"]
         }
     }
 ]
@@ -269,7 +354,10 @@ When the user asks to export data to Notion:
 1. Call get_revit_summary to see what's available and tell the user the counts.
 2. If filtering by keyword or category, call preview_filtered_data first to confirm the count.
 3. Ask: "Would you like to create a new Notion database, or add this as a new version to the existing database?"
-4. Call create_new_database or push_versioned with title, category, and/or keyword.
+4. Call create_new_database or push_versioned — these start the push in the background and return a job_id immediately.
+5. Tell the user the push has started and give them the job_id. Let them know they can ask "check status" to see progress.
+
+When the user asks to check status, use check_job_status with the job_id.
 
 Never call create_new_database or push_versioned more than once per user request.
 Keep responses concise and friendly."""
@@ -304,22 +392,42 @@ def run_tool(name, input_data):
         if not elements:
             return {"error": "No elements found"}
 
-        db_id, err = notion_create_database(title)
-        if err:
-            return {"error": "Failed to create database", "detail": err}
+        job_id = f"job_{int(date.today().strftime('%Y%m%d'))}_{len(_jobs)}"
+        _jobs[job_id] = {"status": "starting", "message": "Starting push..."}
 
-        ok, fail = notion_push_elements(db_id, elements, export_date=str(date.today()))
-        return {"status": "success", "title": title, "pushed": ok, "failed": fail}
+        t = threading.Thread(target=bg_create_new_database, args=(job_id, title, elements))
+        t.daemon = True
+        t.start()
+
+        return {
+            "status":  "started",
+            "job_id":  job_id,
+            "total":   len(elements),
+            "message": f"Push started for '{title}' with {len(elements)} elements."
+        }
 
     elif name == "push_versioned":
         elements = get_filtered_elements(input_data.get("category"), input_data.get("keyword"))
         if not elements:
             return {"error": "No elements found"}
 
-        db_id   = format_uuid(FIXED_DATABASE_ID)
-        version = notion_get_next_version(db_id)
-        ok, fail = notion_push_elements(db_id, elements, version=version, export_date=str(date.today()))
-        return {"status": "success", "version": version, "pushed": ok, "failed": fail}
+        job_id = f"job_{int(date.today().strftime('%Y%m%d'))}_{len(_jobs)}"
+        _jobs[job_id] = {"status": "starting", "message": "Starting push..."}
+
+        t = threading.Thread(target=bg_push_versioned, args=(job_id, elements))
+        t.daemon = True
+        t.start()
+
+        return {
+            "status":  "started",
+            "job_id":  job_id,
+            "total":   len(elements),
+            "message": f"Versioned push started with {len(elements)} elements."
+        }
+
+    elif name == "check_job_status":
+        job_id = input_data.get("job_id")
+        return _jobs.get(job_id, {"status": "not_found", "message": "Job not found."})
 
     return {"error": f"Unknown tool: {name}"}
 
@@ -519,7 +627,7 @@ def chat_ui():
             <div class="suggestion" onclick="sendSuggestion(this)">Export all doors to a new database</div>
             <div class="suggestion" onclick="sendSuggestion(this)">Export FD1 doors only</div>
             <div class="suggestion" onclick="sendSuggestion(this)">Push all rooms with version number</div>
-            <div class="suggestion" onclick="sendSuggestion(this)">Export parking data</div>
+            <div class="suggestion" onclick="sendSuggestion(this)">Check status</div>
         </div>
     </div>
 </div>
