@@ -7,7 +7,8 @@ import anthropic
 import json
 import os
 from datetime import date
-
+from fastapi.background import BackgroundTasks
+import threading
 app = FastAPI()
 
 # ----------------------------------------------------------------
