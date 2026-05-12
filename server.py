@@ -7,8 +7,6 @@ import anthropic
 import json
 import os
 from datetime import date
-import asyncio
-from fastapi.background import BackgroundTasks
 
 app = FastAPI()
 
@@ -32,6 +30,14 @@ class UploadPayload(BaseModel):
 def format_uuid(uid):
     uid = uid.replace("-", "")
     return f"{uid[0:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+
+
+def notion_headers():
+    return {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
 
 
 # ----------------------------------------------------------------
@@ -74,7 +80,7 @@ def get_summary():
 
 
 # ----------------------------------------------------------------
-# Notion helpers
+# Notion schema and helpers
 # ----------------------------------------------------------------
 SCHEMA = {
     "Name":                   {"title": {}},
@@ -161,77 +167,51 @@ def build_props(el, version=None, export_date=None):
     return props
 
 
-@app.post("/create-database")
-def create_database(payload: dict):
-    parent_page_id = format_uuid(payload["parent_page_id"])
-    title = payload["title"]
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
+def notion_create_database(title):
+    """Create a new Notion database and return its ID."""
     body = {
-        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "parent": {"type": "page_id", "page_id": format_uuid(PARENT_PAGE_ID)},
         "title": [{"type": "text", "text": {"content": title}}],
         "properties": SCHEMA
     }
-    res = requests.post("https://api.notion.com/v1/databases", headers=headers, json=body)
+    res  = requests.post("https://api.notion.com/v1/databases", headers=notion_headers(), json=body)
     data = res.json()
     if "id" in data:
-        return {"status": "success", "database_id": format_uuid(data["id"])}
-    return {"status": "error", "detail": data}
+        return format_uuid(data["id"]), None
+    return None, str(data)
 
 
-@app.post("/push-to-notion")
-def push_to_notion(payload: dict):
-    database_id = format_uuid(payload["database_id"])
-    elements    = payload["elements"]
-    version     = payload.get("version")
-    export_date = payload.get("export_date")
-
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
-
-    results = []
+def notion_push_elements(db_id, elements, version=None, export_date=None):
+    """Push elements to a Notion database. Returns (ok_count, fail_count)."""
+    ok, fail = 0, 0
     for el in elements:
         props = build_props(el, version=version, export_date=export_date)
-        body  = {"parent": {"database_id": database_id}, "properties": props}
-        res   = requests.post("https://api.notion.com/v1/pages", headers=headers, json=body)
-        results.append({"name": el.get("name"), "status": res.status_code})
-        if res.status_code != 200:
-            print(f"  FAILED {el.get('name')}: {res.text}")
+        body  = {"parent": {"database_id": db_id}, "properties": props}
+        res   = requests.post("https://api.notion.com/v1/pages", headers=notion_headers(), json=body)
+        if res.status_code == 200:
+            ok += 1
+        else:
+            fail += 1
+            print(f"FAILED {el.get('name')}: {res.text}")
+    return ok, fail
 
-    ok   = len([r for r in results if r["status"] == 200])
-    fail = len([r for r in results if r["status"] != 200])
-    return {"status": "completed", "pushed": ok, "failed": fail}
 
-
-@app.get("/get-next-version")
-def get_next_version(database_id: str):
-    database_id = format_uuid(database_id)
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
-    res = requests.post(
-        f"https://api.notion.com/v1/databases/{database_id}/query",
-        headers=headers, json={}
+def notion_get_next_version(db_id):
+    """Get the next version number for a fixed database."""
+    res  = requests.post(
+        f"https://api.notion.com/v1/databases/{db_id}/query",
+        headers=notion_headers(), json={}
     )
-    data = res.json()
     versions = []
-    for page in data.get("results", []):
+    for page in res.json().get("results", []):
         v = page["properties"].get("Version", {}).get("number")
         if v is not None:
             versions.append(v)
-    return {"next_version": max(versions) + 1 if versions else 1}
+    return max(versions) + 1 if versions else 1
 
 
 # ----------------------------------------------------------------
-# Claude Agent tools (server-side)
+# Claude Agent tools
 # ----------------------------------------------------------------
 TOOLS = [
     {
@@ -294,16 +274,17 @@ Never call create_new_database or push_versioned more than once per user request
 Keep responses concise and friendly."""
 
 
-def run_tool(name, input_data):
-    def get_data(category=None, keyword=None):
-        data = _revit_data
-        if category:
-            data = [e for e in data if e.get("category", "").lower() == category.lower()]
-        if keyword:
-            kw = keyword.lower()
-            data = [e for e in data if kw in e.get("name", "").lower()]
-        return data
+def get_filtered_elements(category=None, keyword=None):
+    data = _revit_data
+    if category:
+        data = [e for e in data if e.get("category", "").lower() == category.lower()]
+    if keyword:
+        kw = keyword.lower()
+        data = [e for e in data if kw in e.get("name", "").lower()]
+    return data
 
+
+def run_tool(name, input_data):
     if name == "get_revit_summary":
         summary = {}
         for el in _revit_data:
@@ -312,84 +293,31 @@ def run_tool(name, input_data):
         return {"summary": summary, "total": len(_revit_data)}
 
     elif name == "preview_filtered_data":
-        elements = get_data(input_data.get("category"), input_data.get("keyword"))
+        elements = get_filtered_elements(input_data.get("category"), input_data.get("keyword"))
         sample   = [e.get("name", "") for e in elements[:5]]
         return {"count": len(elements), "sample_names": sample}
 
     elif name == "create_new_database":
         title    = input_data["title"]
-        elements = get_data(input_data.get("category"), input_data.get("keyword"))
+        elements = get_filtered_elements(input_data.get("category"), input_data.get("keyword"))
         if not elements:
             return {"error": "No elements found"}
 
-        #create_res = requests.post("http://localhost/create-database", json={
-            #"parent_page_id": PARENT_PAGE_ID,
-            #"title": title
-        #})
+        db_id, err = notion_create_database(title)
+        if err:
+            return {"error": "Failed to create database", "detail": err}
 
-        # Call internal functions directly instead of HTTP
-        headers = {
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json"
-        }
-        body = {
-            "parent": {"type": "page_id", "page_id": format_uuid(PARENT_PAGE_ID)},
-            "title": [{"type": "text", "text": {"content": title}}],
-            "properties": SCHEMA
-        }
-        res  = requests.post("https://api.notion.com/v1/databases", headers=headers, json=body)
-        data = res.json()
-        if "id" not in data:
-            return {"error": "Failed to create database", "detail": str(data)}
-
-        db_id = format_uuid(data["id"])
-        ok, fail = 0, 0
-        for el in elements:
-            props   = build_props(el, export_date=str(date.today()))
-            page_body = {"parent": {"database_id": db_id}, "properties": props}
-            page_res  = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page_body)
-            if page_res.status_code == 200:
-                ok += 1
-            else:
-                fail += 1
-
+        ok, fail = notion_push_elements(db_id, elements, export_date=str(date.today()))
         return {"status": "success", "title": title, "pushed": ok, "failed": fail}
 
     elif name == "push_versioned":
-        elements = get_data(input_data.get("category"), input_data.get("keyword"))
+        elements = get_filtered_elements(input_data.get("category"), input_data.get("keyword"))
         if not elements:
             return {"error": "No elements found"}
 
-        headers = {
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json"
-        }
-        db_id = format_uuid(FIXED_DATABASE_ID)
-
-        # Get next version
-        ver_res  = requests.post(
-            f"https://api.notion.com/v1/databases/{db_id}/query",
-            headers=headers, json={}
-        )
-        versions = []
-        for page in ver_res.json().get("results", []):
-            v = page["properties"].get("Version", {}).get("number")
-            if v is not None:
-                versions.append(v)
-        version = max(versions) + 1 if versions else 1
-
-        ok, fail = 0, 0
-        for el in elements:
-            props     = build_props(el, version=version, export_date=str(date.today()))
-            page_body = {"parent": {"database_id": db_id}, "properties": props}
-            page_res  = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page_body)
-            if page_res.status_code == 200:
-                ok += 1
-            else:
-                fail += 1
-
+        db_id   = format_uuid(FIXED_DATABASE_ID)
+        version = notion_get_next_version(db_id)
+        ok, fail = notion_push_elements(db_id, elements, version=version, export_date=str(date.today()))
         return {"status": "success", "version": version, "pushed": ok, "failed": fail}
 
     return {"error": f"Unknown tool: {name}"}
@@ -423,10 +351,7 @@ def ask(req: ChatRequest):
         text_parts = [b.text for b in response.content if b.type == "text"]
 
         if not tool_uses:
-            return {
-                "reply":   " ".join(text_parts),
-                "history": messages
-            }
+            return {"reply": " ".join(text_parts), "history": messages}
 
         tool_results = []
         for tool_block in tool_uses:
@@ -441,7 +366,7 @@ def ask(req: ChatRequest):
 
 
 # ----------------------------------------------------------------
-# Chat UI (HTML page)
+# Chat UI
 # ----------------------------------------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 def chat_ui():
@@ -454,7 +379,6 @@ def chat_ui():
     <title>Revit → Notion BIM Assistant</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: #f5f5f5;
@@ -462,7 +386,6 @@ def chat_ui():
             display: flex;
             flex-direction: column;
         }
-
         header {
             background: #1a1a2e;
             color: white;
@@ -471,16 +394,7 @@ def chat_ui():
             align-items: center;
             gap: 12px;
         }
-
-        header h1 {
-            font-size: 18px;
-            font-weight: 600;
-        }
-
-        header span {
-            font-size: 22px;
-        }
-
+        header h1 { font-size: 18px; font-weight: 600; }
         #status-bar {
             background: #16213e;
             color: #aaa;
@@ -490,16 +404,8 @@ def chat_ui():
             align-items: center;
             gap: 8px;
         }
-
-        #status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #888;
-        }
-
+        #status-dot { width: 8px; height: 8px; border-radius: 50%; background: #888; }
         #status-dot.online { background: #4caf50; }
-
         #chat-container {
             flex: 1;
             overflow-y: auto;
@@ -508,7 +414,6 @@ def chat_ui():
             flex-direction: column;
             gap: 16px;
         }
-
         .message {
             max-width: 70%;
             padding: 12px 16px;
@@ -517,14 +422,12 @@ def chat_ui():
             font-size: 14px;
             white-space: pre-wrap;
         }
-
         .message.user {
             background: #1a1a2e;
             color: white;
             align-self: flex-end;
             border-bottom-right-radius: 4px;
         }
-
         .message.assistant {
             background: white;
             color: #333;
@@ -532,7 +435,6 @@ def chat_ui():
             border-bottom-left-radius: 4px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
-
         .message.thinking {
             background: white;
             color: #999;
@@ -540,7 +442,6 @@ def chat_ui():
             font-style: italic;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
-
         #input-area {
             background: white;
             border-top: 1px solid #e0e0e0;
@@ -548,7 +449,6 @@ def chat_ui():
             display: flex;
             gap: 12px;
         }
-
         #user-input {
             flex: 1;
             border: 1px solid #ddd;
@@ -558,13 +458,8 @@ def chat_ui():
             outline: none;
             resize: none;
             height: 44px;
-            line-height: 1.5;
         }
-
-        #user-input:focus {
-            border-color: #1a1a2e;
-        }
-
+        #user-input:focus { border-color: #1a1a2e; }
         #send-btn {
             background: #1a1a2e;
             color: white;
@@ -575,10 +470,8 @@ def chat_ui():
             cursor: pointer;
             height: 44px;
         }
-
         #send-btn:hover { background: #16213e; }
         #send-btn:disabled { background: #999; cursor: not-allowed; }
-
         .welcome {
             text-align: center;
             color: #999;
@@ -586,13 +479,7 @@ def chat_ui():
             margin: auto;
             padding: 40px;
         }
-
-        .welcome h2 {
-            font-size: 20px;
-            color: #555;
-            margin-bottom: 8px;
-        }
-
+        .welcome h2 { font-size: 20px; color: #555; margin-bottom: 8px; }
         .suggestions {
             display: flex;
             flex-wrap: wrap;
@@ -600,7 +487,6 @@ def chat_ui():
             justify-content: center;
             margin-top: 16px;
         }
-
         .suggestion {
             background: white;
             border: 1px solid #ddd;
@@ -610,25 +496,18 @@ def chat_ui():
             cursor: pointer;
             color: #555;
         }
-
-        .suggestion:hover {
-            border-color: #1a1a2e;
-            color: #1a1a2e;
-        }
+        .suggestion:hover { border-color: #1a1a2e; color: #1a1a2e; }
     </style>
 </head>
 <body>
-
 <header>
     <span>🏗️</span>
     <h1>Revit → Notion BIM Assistant</h1>
 </header>
-
 <div id="status-bar">
     <div id="status-dot"></div>
     <span id="status-text">Checking server...</span>
 </div>
-
 <div id="chat-container">
     <div class="welcome">
         <h2>Hi! I'm your BIM Assistant</h2>
@@ -643,16 +522,13 @@ def chat_ui():
         </div>
     </div>
 </div>
-
 <div id="input-area">
-    <textarea id="user-input" placeholder="Ask me to export data to Notion..." rows="1"></textarea>
+    <textarea id="user-input" placeholder="Ask me to export data to Notion..."></textarea>
     <button id="send-btn" onclick="sendMessage()">Send</button>
 </div>
-
 <script>
     let history = [];
 
-    // Check server status
     fetch('/get-summary')
         .then(r => r.json())
         .then(data => {
@@ -679,7 +555,6 @@ def chat_ui():
     function addMessage(text, role) {
         const welcome = document.querySelector('.welcome');
         if (welcome) welcome.remove();
-
         const container = document.getElementById('chat-container');
         const div = document.createElement('div');
         div.className = 'message ' + role;
@@ -694,13 +569,10 @@ def chat_ui():
         const btn   = document.getElementById('send-btn');
         const text  = input.value.trim();
         if (!text) return;
-
         input.value = '';
         btn.disabled = true;
-
         addMessage(text, 'user');
         const thinking = addMessage('Thinking...', 'thinking');
-
         try {
             const res = await fetch('/ask', {
                 method: 'POST',
@@ -713,14 +585,12 @@ def chat_ui():
             history = data.history;
         } catch (e) {
             thinking.remove();
-            addMessage('Error connecting to server. Please try again.', 'assistant');
+            addMessage('Error: ' + e.message, 'assistant');
         }
-
         btn.disabled = false;
         input.focus();
     }
 
-    // Send on Enter (Shift+Enter for new line)
     document.getElementById('user-input').addEventListener('keydown', function(e) {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
@@ -728,7 +598,6 @@ def chat_ui():
         }
     });
 </script>
-
 </body>
 </html>
 """
