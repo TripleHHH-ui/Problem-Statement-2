@@ -4,7 +4,7 @@ import requests
 import anthropic
 from datetime import date
 
-AUTOMATION_SERVER = "http://127.0.0.1:8000"
+AUTOMATION_SERVER = "https://problem-statement-2-production.up.railway.app/chat"
 MODEL_NAME        = "claude-sonnet-4-20250514"
 PARENT_PAGE_ID    = "3492bc72289b8081970ac57e2816e0c5"
 FIXED_DATABASE_ID = "3492bc72289b80dda791c15cf5a575e4"
